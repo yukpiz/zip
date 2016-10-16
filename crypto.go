@@ -443,6 +443,12 @@ func (h *FileHeader) SetPassword(password string) {
 	}
 }
 
+func (h *FileHeader) SetDecryptionPassword(password string) {
+	h.password = func() []byte {
+		return []byte(password)
+	}
+}
+
 // PasswordFn is a function that returns the password
 // as a byte slice
 type passwordFn func() []byte
@@ -457,6 +463,6 @@ func (w *Writer) Encrypt(name string, password string) (io.Writer, error) {
 		Name:   name,
 		Method: Deflate,
 	}
-	fh.SetPassword(password)
+	fh.SetDecryptionPassword(password)
 	return w.CreateHeader(fh)
 }

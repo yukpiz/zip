@@ -143,14 +143,21 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	size := int64(f.CompressedSize64)
 	var r io.Reader
 	rr := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+
 	// check for encryption
 	if f.IsEncrypted() {
-		if r, err = newDecryptionReader(rr, f); err != nil {
+		if f.ae == 0 {
+			fmt.Printf("CRC32: %X ---- %v\n", f.CRC32, f.CRC32)
+			if r, err = ZipCryptoDecryptor(rr, f.password()); err != nil {
+				return
+			}
+		} else if r, err = newDecryptionReader(rr, f); err != nil {
 			return
 		}
 	} else {
 		r = rr
 	}
+
 	dcomp := decompressor(f.Method)
 	if dcomp == nil {
 		err = ErrAlgorithm
@@ -254,14 +261,21 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	f.CreatorVersion = b.uint16()
 	f.ReaderVersion = b.uint16()
 	f.Flags = b.uint16()
+	fmt.Printf("FLAG: %X\n", f.Flags)
 	f.Method = b.uint16()
+	fmt.Printf("METHOD: %X\n", f.Method)
 	f.ModifiedTime = b.uint16()
 	f.ModifiedDate = b.uint16()
 	f.CRC32 = b.uint32()
+	fmt.Printf("Directory CRC: %X\n", f.CRC32)
 	f.CompressedSize = b.uint32()
 	f.UncompressedSize = b.uint32()
 	f.CompressedSize64 = uint64(f.CompressedSize)
 	f.UncompressedSize64 = uint64(f.UncompressedSize)
+	fmt.Printf("ZIP Size 1: %v\n", f.CompressedSize)
+	fmt.Printf("ZIP Size 2: %v\n", f.CompressedSize64)
+	fmt.Printf("File Size 1: %v\n", f.UncompressedSize)
+	fmt.Printf("File Size 2: %v\n", f.UncompressedSize64)
 	filenameLen := int(b.uint16())
 	extraLen := int(b.uint16())
 	commentLen := int(b.uint16())

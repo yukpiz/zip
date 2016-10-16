@@ -11,17 +11,18 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"fmt"
 )
 
 // TODO(adg): support zip file comments
-// TODO(adg): support specifying deflate level
 
 // Writer implements a zip file writer.
 type Writer struct {
-	cw     *countWriter
-	dir    []*header
-	last   *fileWriter
-	closed bool
+	cw          *countWriter
+	dir         []*header
+	last        *fileWriter
+	closed      bool
+	compressors map[uint16]Compressor
 }
 
 type header struct {
@@ -52,7 +53,7 @@ func (w *Writer) Flush() error {
 }
 
 // Close finishes writing the zip file by writing the central directory.
-// It does not (and can not) close the underlying writer.
+// It does not (and cannot) close the underlying writer.
 func (w *Writer) Close() error {
 	if w.last != nil && !w.last.closed {
 		if err := w.last.close(); err != nil {
@@ -78,7 +79,8 @@ func (w *Writer) Close() error {
 		b.uint16(h.ModifiedTime)
 		b.uint16(h.ModifiedDate)
 		b.uint32(h.CRC32)
-		if h.isZip64() || h.offset > uint32max {
+
+		if h.isZip64() || h.offset >= uint32max {
 			// the file needs a zip64 header. store maxint in both
 			// 32 bit size fields (and offset later) to signal that the
 			// zip64 extra header should be used.
@@ -98,6 +100,7 @@ func (w *Writer) Close() error {
 			b.uint32(h.CompressedSize)
 			b.uint32(h.UncompressedSize)
 		}
+
 		b.uint16(uint16(len(h.Name)))
 		b.uint16(uint16(len(h.Extra)))
 		b.uint16(uint16(len(h.Comment)))
@@ -211,8 +214,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	}
 
 	fh.Flags |= 0x8 // we will write a data descriptor
-	// TODO(alex): Look at spec and see if these need to be changed
-	// when using encryption.
+
 	fh.CreatorVersion = fh.CreatorVersion&0xff00 | zipVersion20 // preserve compatibility byte
 	fh.ReaderVersion = zipVersion20
 
@@ -221,18 +223,17 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 		compCount: &countWriter{w: w.cw},
 		crc32:     crc32.NewIEEE(),
 	}
-	// Get the compressor before possibly changing Method to 99 due to password
-	comp := compressor(fh.Method)
+	comp := w.compressor(fh.Method)
 	if comp == nil {
 		return nil, ErrAlgorithm
 	}
 	// check for password
 	var sw io.Writer = fw.compCount
 	if fh.password != nil {
-		// we have a password and need to encrypt.
-		fh.writeWinZipExtra()
-		fh.Method = 99 // ok to change, we've gotten the comp and wrote extra
-		ew, err := newEncryptionWriter(sw, fh.password, fw)
+		if !fh.IsEncrypted() {
+			fh.setEncryptionBit()
+		}
+		ew, err := ZipCryptoEncryptor(sw, fh.password, fw)
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +273,7 @@ func writeHeader(w io.Writer, h *FileHeader) error {
 	b.uint32(0) // since we are writing a data descriptor crc32,
 	b.uint32(0) // compressed size,
 	b.uint32(0) // and uncompressed size should be zero
+	fmt.Printf("File HEader Wring %0 X, %v, %v\n", h.CRC32, h.CompressedSize, h.UncompressedSize)
 	b.uint16(uint16(len(h.Name)))
 	b.uint16(uint16(len(h.Extra)))
 	if _, err := w.Write(buf[:]); err != nil {
@@ -282,6 +284,24 @@ func writeHeader(w io.Writer, h *FileHeader) error {
 	}
 	_, err := w.Write(h.Extra)
 	return err
+}
+
+// RegisterCompressor registers or overrides a custom compressor for a specific
+// method ID. If a compressor for a given method is not found, Writer will
+// default to looking up the compressor at the package level.
+func (w *Writer) RegisterCompressor(method uint16, comp Compressor) {
+	if w.compressors == nil {
+		w.compressors = make(map[uint16]Compressor)
+	}
+	w.compressors[method] = comp
+}
+
+func (w *Writer) compressor(method uint16) Compressor {
+	comp := w.compressors[method]
+	if comp == nil {
+		comp = compressor(method)
+	}
+	return comp
 }
 
 type fileWriter struct {
@@ -312,21 +332,10 @@ func (w *fileWriter) close() error {
 	if err := w.comp.Close(); err != nil {
 		return err
 	}
-	// if encrypted grab the hmac and write it out
-	if w.header.IsEncrypted() {
-		authCode := w.hmac.Sum(nil)
-		authCode = authCode[:10]
-		_, err := w.compCount.Write(authCode)
-		if err != nil {
-			return errors.New("zip: error writing authcode")
-		}
-	}
+
 	// update FileHeader
 	fh := w.header.FileHeader
-	// ae-2 we don't write out CRC
-	if !fh.IsEncrypted() {
-		fh.CRC32 = w.crc32.Sum32()
-	}
+	fh.CRC32 = w.crc32.Sum32()
 	fh.CompressedSize64 = uint64(w.compCount.count)
 	fh.UncompressedSize64 = uint64(w.rawCount.count)
 
